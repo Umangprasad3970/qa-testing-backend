@@ -1,4 +1,4 @@
-import os, json, re, urllib.request, urllib.error
+import os, json, re, urllib.request, urllib.error, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
@@ -57,7 +57,7 @@ def ensure_browser_schema():
             else:
                 conn.execute(sql_text("ALTER TABLE test_results ADD COLUMN browser VARCHAR(40) NOT NULL DEFAULT 'chrome'"))
 ensure_browser_schema()
-app=FastAPI(title="QA Testing Platform API",version="4.0.0"); app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
+app=FastAPI(title="QA Testing Platform API",version="5.0.0"); app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 def db():
  s=SessionLocal();
  try: yield s
@@ -179,10 +179,34 @@ def generate(project_id:int,user:User=Depends(current_user),session:Session=Depe
  if not p or p.user_id!=user.id: raise HTTPException(404,"Project not found")
  d=session.query(ProjectDocument).filter(ProjectDocument.project_id==project_id).order_by(ProjectDocument.id.desc()).first()
  if not d: raise HTTPException(400,"Upload a project document first")
- cases,source=ai_cases(d.content_text,p.website_url)
- session.query(TestCase).filter(TestCase.project_id==project_id).delete(synchronize_session=False)
- for c in cases: session.add(TestCase(project_id=project_id,title=c["title"][:255],steps=c["steps"],expected_result=c["expected_result"]))
- session.commit();return {"message":f"Created {len(cases)} test cases ({source})","created":len(cases),"source":source}
+ try:
+  cases,source=ai_cases(d.content_text,p.website_url)
+  if not cases: raise HTTPException(400,"No test cases could be generated from the document")
+
+  # Delete dependent results before deleting test cases. PostgreSQL otherwise
+  # raises a foreign-key violation when an old test case still has results.
+  old_cases=session.query(TestCase).filter(TestCase.project_id==project_id).all()
+  old_ids=[tc.id for tc in old_cases]
+  if old_ids:
+   session.query(TestResult).filter(TestResult.test_case_id.in_(old_ids)).delete(synchronize_session=False)
+   session.query(TestCase).filter(TestCase.id.in_(old_ids)).delete(synchronize_session=False)
+   session.flush()
+
+  for c in cases:
+   session.add(TestCase(
+    project_id=project_id,
+    title=str(c.get("title", "Untitled test case"))[:255],
+    steps=str(c.get("steps", "")),
+    expected_result=str(c.get("expected_result", ""))
+   ))
+  session.commit()
+  return {"message":f"Created {len(cases)} test cases ({source})","created":len(cases),"source":source}
+ except HTTPException:
+  session.rollback()
+  raise
+ except Exception as e:
+  session.rollback()
+  raise HTTPException(500,f"Test case generation failed: {str(e)[:500]}")
 @app.get("/api/projects/{project_id}/test-cases")
 def get_cases(project_id:int,user:User=Depends(current_user),session:Session=Depends(db)):
  p=session.get(Project,project_id)
@@ -287,8 +311,8 @@ def run_tests(data:TestRunIn,user:User=Depends(current_user),session:Session=Dep
  if not p or p.user_id!=user.id: raise HTTPException(404,"Project not found")
  cases=p.test_cases
  if not cases: raise HTTPException(400,"Generate test cases first")
- browsers=[b.lower() for b in (data.browsers or ["chrome","firefox","safari","opera"]) ]
- if not browsers: browsers=["chrome","firefox","safari","opera"]
+ browsers=[b.lower().strip() for b in (data.browsers or ["chrome","firefox","safari","opera"])]
+ browsers=list(dict.fromkeys(browsers))
  invalid=[b for b in browsers if b not in SUPPORTED_BROWSERS]
  if invalid: raise HTTPException(400,f"Unsupported browsers: {', '.join(invalid)}")
  r=TestRun(project_id=p.id,status="running",started_at=datetime.now(timezone.utc));session.add(r);session.flush()
@@ -297,29 +321,36 @@ def run_tests(data:TestRunIn,user:User=Depends(current_user),session:Session=Dep
   async with async_playwright() as pw:
    out=[]
    for browser_name in browsers:
+    browser=None
     try:
      browser=await _launch_browser(pw,browser_name)
      page=await browser.new_page(viewport={"width":1280,"height":900})
      for tc in cases:
       status,err,dur=await _browser_case(page,tc,p.website_url)
       out.append((tc,browser_name,status,err,dur))
-     await browser.close()
     except Exception as e:
      for tc in cases:
       out.append((tc,browser_name,"failed",f"{_browser_engine_label(browser_name)} could not be started: {str(e)[:450]}",None))
+    finally:
+     if browser:
+      try: await browser.close()
+      except Exception: pass
    return out
 
- if PLAYWRIGHT_AVAILABLE:
-  try: results=asyncio.run(execute())
-  except Exception as e: results=[(tc,b,"failed",f"Automation run could not start: {str(e)[:450]}",None) for b in browsers for tc in cases]
- else:
-  results=[(tc,b,"failed","Playwright is not installed on the server.",None) for b in browsers for tc in cases]
+ try:
+  results=asyncio.run(execute()) if PLAYWRIGHT_AVAILABLE else [
+   (tc,b,"failed","Playwright is not installed on the server.",None)
+   for b in browsers for tc in cases
+  ]
+ except Exception as e:
+  results=[(tc,b,"failed",f"Automation run could not start: {str(e)[:450]}",None) for b in browsers for tc in cases]
 
  for tc,browser,status,err,dur in results:
-  session.add(TestResult(run_id=r.id,test_case_id=tc.id,browser=browser,status=status,error_message=err,duration_ms=dur))
- passed=sum(x[2]=="passed" for x in results); failed=sum(x[2]=="failed" for x in results); blocked=sum(x[2]=="blocked" for x in results); total=len(results)
+  normalized="passed" if status=="passed" else "failed"
+  session.add(TestResult(run_id=r.id,test_case_id=tc.id,browser=browser,status=normalized,error_message=err,duration_ms=dur))
+ passed=sum(x[2]=="passed" for x in results); failed=sum(x[2]!="passed" for x in results); total=len(results)
  r.status="completed"; r.finished_at=datetime.now(timezone.utc); session.commit()
- return {"message":f"Cross-browser run completed: {passed} passed, {failed} failed, {blocked} blocked across {len(browsers)} browser(s)","run_id":r.id,"status":r.status,"browsers":browsers,"total":total,"passed":passed,"failed":failed,"blocked":blocked}
+ return {"message":f"Cross-browser run completed: {passed} passed, {failed} failed across {len(browsers)} browser(s)","run_id":r.id,"status":r.status,"browsers":browsers,"total":total,"passed":passed,"failed":failed,"not_run":0}
 
 @app.get("/api/projects/{project_id}/report")
 def project_report(project_id:int,user:User=Depends(current_user),session:Session=Depends(db)):
@@ -331,8 +362,11 @@ def project_report(project_id:int,user:User=Depends(current_user),session:Sessio
   for x in latest.results:
    tc=session.get(TestCase,x.test_case_id)
    results.append({"test_case_id":x.test_case_id,"test_case_title":tc.title if tc else None,"browser":x.browser,"status":x.status,"error_message":x.error_message,"duration_ms":x.duration_ms})
- total=len(results); passed=sum(x["status"]=="passed" for x in results); failed=sum(x["status"]=="failed" for x in results); notrun=max(0,len(p.test_cases)*max(1,len(set(x["browser"] for x in results))) - total) if results else len(p.test_cases)
- return {"project_name":p.name,"website_url":p.website_url,"total":total,"passed":passed,"failed":failed,"not_run":notrun,"pass_percentage":round(passed*100/total,2) if total else 0,"final_status":"PASS" if total and failed==0  else ("FAIL" if failed else "NOT RUN"),"results":results,"browsers":sorted(set(x["browser"] for x in results))}
+ total=len(results); passed=sum(x["status"]=="passed" for x in results); failed=sum(x["status"]=="failed" for x in results)
+ expected=len(p.test_cases)*len(set(x["browser"] for x in results)) if results else len(p.test_cases)*4
+ notrun=max(0,expected-total)
+ final_status="PASS" if expected and failed==0 and notrun==0 else ("FAIL" if failed else "NOT RUN")
+ return {"project_name":p.name,"website_url":p.website_url,"total":total,"passed":passed,"failed":failed,"not_run":notrun,"pass_percentage":round(passed*100/total,2) if total else 0,"final_status":final_status,"results":results,"browsers":sorted(set(x["browser"] for x in results))}
 
 @app.get("/api/admin/dashboard")
 def admin_dashboard(admin:User=Depends(admin_only),session:Session=Depends(db)):
@@ -467,8 +501,8 @@ def admin_project_report(project_id:int, admin:User=Depends(admin_only), session
         for tc in cases:
             x=by.get(tc.id)
             results.append({'test_case_id':tc.id,'title':tc.title,'status':x.status if x else 'not_run','error_message':x.error_message if x else None,'duration_ms':x.duration_ms if x else None})
-    total=len(cases); passed=sum(x['status']=='passed' for x in results); failed=sum(x['status']=='failed' for x in results); blocked=sum(x['status']=='blocked' for x in results); notrun=total-passed-failed-blocked
-    return {'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'total':total,'passed':passed,'failed':failed,'blocked':blocked,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0  and notrun==0 else ('FAIL' if failed else ('BLOCKED' if blocked else 'NOT RUN')),'latest_run_id':latest.id if latest else None,'latest_run_status':latest.status if latest else None,'results':results}
+    total=len(cases); passed=sum(x['status']=='passed' for x in results); failed=sum(x['status']=='failed' for x in results); notrun=total-passed-failed
+    return {'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'total':total,'passed':passed,'failed':failed,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0 and notrun==0 else ('FAIL' if failed else 'NOT RUN'),'latest_run_id':latest.id if latest else None,'latest_run_status':latest.status if latest else None,'results':results}
 
 @app.get('/api/admin/project-reports')
 def admin_project_reports(admin:User=Depends(admin_only), session:Session=Depends(db)):
@@ -476,9 +510,11 @@ def admin_project_reports(admin:User=Depends(admin_only), session:Session=Depend
     for p in session.query(Project).order_by(Project.id.desc()).all():
         latest=session.query(TestRun).filter(TestRun.project_id==p.id).order_by(TestRun.id.desc()).first()
         rs=session.query(TestResult).filter(TestResult.run_id==latest.id).all() if latest else []
-        total=len(rs); passed=sum(x.status=='passed' for x in rs); failed=sum(x.status=='failed' for x in rs); notrun=0
+        total=len(rs); passed=sum(x.status=='passed' for x in rs); failed=sum(x.status=='failed' for x in rs)
         browsers=sorted({x.browser for x in rs})
-        out.append({'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'test_cases':len(p.test_cases),'total':total,'passed':passed,'failed':failed,'blocked':blocked,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0  else ('FAIL' if failed else ('BLOCKED' if blocked else 'NOT RUN')),'last_run_id':latest.id if latest else None,'last_run_status':latest.status if latest else None,'browsers':browsers})
+        expected=len(p.test_cases)*len(browsers) if browsers else len(p.test_cases)*4
+        notrun=max(0,expected-total)
+        out.append({'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'test_cases':len(p.test_cases),'total':total,'passed':passed,'failed':failed,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if expected and failed==0 and notrun==0 else ('FAIL' if failed else 'NOT RUN'),'last_run_id':latest.id if latest else None,'last_run_status':latest.status if latest else None,'browsers':browsers})
     return out
 
 @app.delete('/api/admin/test-cases/{test_case_id}')
