@@ -289,3 +289,63 @@ def admin_test_results(admin:User=Depends(admin_only),session:Session=Depends(db
   tc=session.get(TestCase,x.test_case_id); run=x.run; project=session.get(Project,run.project_id)
   rows.append({"id":x.id,"run_id":x.run_id,"test_case_id":x.test_case_id,"test_case_title":tc.title if tc else None,"project_id":project.id,"project_name":project.name,"user_id":project.user_id,"status":x.status,"error_message":x.error_message,"duration_ms":x.duration_ms})
  return rows
+
+# --- Dedicated admin pages and management/report APIs ---
+@app.get('/admin/users')
+def admin_users_page(): return FileResponse('users.html')
+@app.get('/admin/projects')
+def admin_projects_page(): return FileResponse('projects.html')
+@app.get('/admin/test-cases')
+def admin_test_cases_page(): return FileResponse('test_cases.html')
+@app.get('/admin/test-results')
+def admin_test_results_page(): return FileResponse('test_results.html')
+@app.get('/admin/project-reports')
+def admin_project_reports_page(): return FileResponse('project_reports.html')
+@app.get('/admin.css')
+def admin_css(): return FileResponse('admin.css', media_type='text/css')
+@app.get('/admin_common.js')
+def admin_common_js(): return FileResponse('admin_common.js', media_type='application/javascript')
+
+@app.delete('/api/admin/projects/{project_id}')
+def admin_delete_project(project_id:int, admin:User=Depends(admin_only), session:Session=Depends(db)):
+    p=session.get(Project,project_id)
+    if not p: raise HTTPException(404,'Project not found')
+    for run in session.query(TestRun).filter(TestRun.project_id==p.id).all():
+        session.query(TestResult).filter(TestResult.run_id==run.id).delete(synchronize_session=False)
+    session.query(TestRun).filter(TestRun.project_id==p.id).delete(synchronize_session=False)
+    session.query(TestCase).filter(TestCase.project_id==p.id).delete(synchronize_session=False)
+    session.query(ProjectDocument).filter(ProjectDocument.project_id==p.id).delete(synchronize_session=False)
+    session.delete(p); session.commit()
+    return {'message':'Project and related QA data deleted','id':project_id}
+
+@app.get('/api/admin/projects/{project_id}/report')
+def admin_project_report(project_id:int, admin:User=Depends(admin_only), session:Session=Depends(db)):
+    p=session.get(Project,project_id)
+    if not p: raise HTTPException(404,'Project not found')
+    cases=p.test_cases
+    latest=session.query(TestRun).filter(TestRun.project_id==p.id).order_by(TestRun.id.desc()).first()
+    results=[]
+    if latest:
+        by={x.test_case_id:x for x in latest.results}
+        for tc in cases:
+            x=by.get(tc.id)
+            results.append({'test_case_id':tc.id,'title':tc.title,'status':x.status if x else 'not_run','error_message':x.error_message if x else None,'duration_ms':x.duration_ms if x else None})
+    total=len(cases); passed=sum(x['status']=='passed' for x in results); failed=sum(x['status']=='failed' for x in results); notrun=total-passed-failed
+    return {'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'total':total,'passed':passed,'failed':failed,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0 and notrun==0 else ('FAIL' if failed else 'NOT RUN'),'latest_run_id':latest.id if latest else None,'latest_run_status':latest.status if latest else None,'results':results}
+
+@app.get('/api/admin/project-reports')
+def admin_project_reports(admin:User=Depends(admin_only), session:Session=Depends(db)):
+    out=[]
+    for p in session.query(Project).order_by(Project.id.desc()).all():
+        latest=session.query(TestRun).filter(TestRun.project_id==p.id).order_by(TestRun.id.desc()).first()
+        rs=session.query(TestResult).filter(TestResult.run_id==latest.id).all() if latest else []
+        total=len(p.test_cases); passed=sum(x.status=='passed' for x in rs); failed=sum(x.status=='failed' for x in rs); notrun=total-passed-failed
+        out.append({'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'total':total,'passed':passed,'failed':failed,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0 and notrun==0 else ('FAIL' if failed else 'NOT RUN'),'last_run_id':latest.id if latest else None,'last_run_status':latest.status if latest else None})
+    return out
+
+@app.delete('/api/admin/test-cases/{test_case_id}')
+def admin_delete_test_case(test_case_id:int, admin:User=Depends(admin_only), session:Session=Depends(db)):
+    tc=session.get(TestCase,test_case_id)
+    if not tc: raise HTTPException(404,'Test case not found')
+    session.query(TestResult).filter(TestResult.test_case_id==test_case_id).delete(synchronize_session=False)
+    session.delete(tc); session.commit(); return {'message':'Test case deleted','id':test_case_id}

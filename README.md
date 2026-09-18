@@ -1,24 +1,36 @@
-# QA Testing Platform Backend — V4 User/Admin Access
+# QA Testing Platform Backend V4
 
-FastAPI backend for the QA Testing Platform with local QA AI, strict user isolation, and administrator user/work management.
+FastAPI backend with user/admin RBAC, local QA AI, document upload, test-case generation, automated smoke testing, project reports, and a dedicated multi-page admin panel.
 
-## Access model
-- Administrator accounts are created from `ADMIN_EMAIL` / `ADMIN_PASSWORD` and are intended for the web Admin console.
-- Admins create normal users. Public self-registration is disabled.
-- Normal users can sign in to the Android/mobile app and Windows software through `POST /api/auth/client-login` using `client_type=android` or `client_type=windows`.
-- Admin accounts are rejected by the client-login endpoint.
-- Inactive users are rejected from login.
-- Every project/document/test case/run/report endpoint is scoped to the authenticated user's own projects.
-- Admin endpoints can view and manage all users and all user work.
+## Admin panel
+- `/admin` — Admin login + dashboard
+- `/admin/users` — User Management
+- `/admin/projects` — Project List
+- `/admin/test-cases` — Test Cases
+- `/admin/test-results` — Test Case Results
+- `/admin/project-reports` — Project Report Summary
 
-## Admin user management
-- `POST /api/admin/users` — create user
-- `GET /api/admin/users` — list users
-- `GET /api/admin/users/{id}` — view user
-- `PUT /api/admin/users/{id}` — edit name/email/password
-- `PATCH /api/admin/users/{id}/status` — activate/deactivate
-- `DELETE /api/admin/users/{id}` — delete user and all owned QA work
-- `GET /api/admin/users/{id}/work` — view the user's projects and latest report summaries
-- Existing admin lists expose all projects, test cases, test runs and test results.
+Admin must log in first. The browser stores an admin JWT and every admin API requires that JWT plus `is_admin=true` on the server.
 
-No OpenAI API key is required.
+## Admin APIs
+- `POST /api/auth/login`
+- `GET /api/admin/dashboard`
+- `POST /api/admin/users`
+- `GET /api/admin/users`
+- `GET /api/admin/users/{id}`
+- `GET /api/admin/users/{id}/work`
+- `PUT /api/admin/users/{id}`
+- `PATCH /api/admin/users/{id}/status`
+- `DELETE /api/admin/users/{id}`
+- `GET /api/admin/projects`
+- `DELETE /api/admin/projects/{id}`
+- `GET /api/admin/projects/{id}/report`
+- `GET /api/admin/project-reports`
+- `GET /api/admin/test-cases`
+- `DELETE /api/admin/test-cases/{id}`
+- `GET /api/admin/test-results`
+
+## User isolation
+Client users authenticate with `/api/auth/client-login?client_type=android` or `windows`. Admin accounts are rejected from those clients. Project/document/test-case/run/report routes verify the authenticated user's `user_id` against the project owner, so changing IDs cannot expose another user's work.
+
+No OpenAI API key is required. The local QA AI uses the bundled NLP/ML engine.
