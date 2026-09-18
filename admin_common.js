@@ -5,3 +5,5 @@ function esc(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt
 function guard(){if(!token())location.href='/admin';}
 function logout(){localStorage.removeItem(TOKEN);location.href='/admin'}
 async function navUser(){try{return await api('/admin/dashboard')}catch(e){logout()}}
+
+async function requireAdmin(){if(!token()){location.href='/admin';return false;}try{await api('/admin/dashboard');return true}catch(e){localStorage.removeItem(TOKEN);location.href='/admin';return false;}}
