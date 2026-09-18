@@ -1,7 +1,0 @@
-__pycache__/
-*.pyc
-.venv/
-.env
-qa_platform.db
-.vscode/
-.idea/

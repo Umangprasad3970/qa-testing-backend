@@ -1,21 +1,24 @@
-# QA Testing Platform Backend V1
+# QA Testing Platform Backend — V4 User/Admin Access
 
-FastAPI API + PostgreSQL + protected Admin Dashboard.
+FastAPI backend for the QA Testing Platform with local QA AI, strict user isolation, and administrator user/work management.
 
-Local:
-python -m venv .venv
-Windows: .venv\Scripts\activate
-Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload
+## Access model
+- Administrator accounts are created from `ADMIN_EMAIL` / `ADMIN_PASSWORD` and are intended for the web Admin console.
+- Admins create normal users. Public self-registration is disabled.
+- Normal users can sign in to the Android/mobile app and Windows software through `POST /api/auth/client-login` using `client_type=android` or `client_type=windows`.
+- Admin accounts are rejected by the client-login endpoint.
+- Inactive users are rejected from login.
+- Every project/document/test case/run/report endpoint is scoped to the authenticated user's own projects.
+- Admin endpoints can view and manage all users and all user work.
 
-Admin: http://127.0.0.1:8000/admin
-API docs: http://127.0.0.1:8000/docs
+## Admin user management
+- `POST /api/admin/users` — create user
+- `GET /api/admin/users` — list users
+- `GET /api/admin/users/{id}` — view user
+- `PUT /api/admin/users/{id}` — edit name/email/password
+- `PATCH /api/admin/users/{id}/status` — activate/deactivate
+- `DELETE /api/admin/users/{id}` — delete user and all owned QA work
+- `GET /api/admin/users/{id}/work` — view the user's projects and latest report summaries
+- Existing admin lists expose all projects, test cases, test runs and test results.
 
-Render:
-1. Push this folder to GitHub.
-2. In Render, create a Blueprint from the repo.
-3. Set ADMIN_EMAIL and ADMIN_PASSWORD.
-4. Deploy.
-
-IMPORTANT: Render currently states that Free Postgres databases expire after 30 days, so this free database is for development/testing unless upgraded before expiry.
+No OpenAI API key is required.
