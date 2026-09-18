@@ -1,0 +1,38 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QA Platform Admin</title>
+<style>
+body{font-family:Arial;margin:0;background:#f4f7fb;color:#18212f}.top{background:#111827;color:#fff;padding:18px 24px;display:flex;justify-content:space-between}
+.wrap{padding:24px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.card{background:#fff;padding:18px;border-radius:12px;box-shadow:0 2px 10px #0001}.num{font-size:28px;font-weight:bold}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:22px 0}.tabs button{padding:10px 14px;border:0;border-radius:8px;background:#e5e7eb;cursor:pointer}
+.panel{background:#fff;border-radius:12px;padding:18px;overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;vertical-align:top;font-size:14px}th{background:#f9fafb}
+.login{max-width:380px;margin:90px auto;background:#fff;padding:25px;border-radius:14px;box-shadow:0 5px 25px #0002}.login input{width:100%;box-sizing:border-box;padding:12px;margin:7px 0;border:1px solid #ddd;border-radius:8px}.login button{width:100%;padding:12px;margin-top:8px;background:#111827;color:#fff;border:0;border-radius:8px}.hide{display:none}.error{color:#b91c1c}
+</style></head><body>
+<div id="login" class="login"><h2>QA Platform Admin</h2><p>Administrator login</p>
+<input id="email" placeholder="Admin email" type="email"><input id="password" placeholder="Password" type="password">
+<button onclick="login()">Login</button><p id="err" class="error"></p></div>
+<div id="app" class="hide"><div class="top"><b>QA Testing Platform - Admin</b><button onclick="logout()">Logout</button></div>
+<div class="wrap"><div class="cards" id="cards"></div>
+<div class="tabs"><button onclick="loadTable('users')">Users</button><button onclick="loadTable('projects')">Projects</button>
+<button onclick="loadTable('test-cases')">Test Cases</button><button onclick="loadTable('test-runs')">Test Runs</button>
+<button onclick="loadTable('test-results')">Test Results</button></div>
+<div class="panel"><div id="table">Select a section.</div></div></div></div>
+<script>
+const tokenKey='qa_admin_token';
+async function api(path,opts={}){opts.headers={...(opts.headers||{}),'Authorization':'Bearer '+localStorage.getItem(tokenKey),'Content-Type':'application/json'};
+let r=await fetch(path,opts);if(!r.ok)throw new Error((await r.json()).detail||'Request failed');return r.json()}
+async function login(){try{let r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({email:email.value,password:password.value})});let d=await r.json();if(!r.ok)throw new Error(d.detail);
+if(!d.is_admin)throw new Error('This account is not an administrator');localStorage.setItem(tokenKey,d.access_token);showApp()}catch(e){err.textContent=e.message}}
+function logout(){localStorage.removeItem(tokenKey);location.reload()}
+async function showApp(){if(!localStorage.getItem(tokenKey))return;try{let d=await api('/api/admin/dashboard');
+document.getElementById('login').classList.add('hide');document.getElementById('app').classList.remove('hide');
+cards.innerHTML=Object.entries(d).map(([k,v])=>`<div class="card"><div>${k.replaceAll('_',' ').toUpperCase()}</div><div class="num">${v}</div></div>`).join('');
+loadTable('users')}catch(e){logout()}}
+function esc(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
+async function loadTable(name){try{let data=await api('/api/admin/'+name);if(!data.length){table.innerHTML='<p>No records.</p>';return}
+let keys=Object.keys(data[0]);table.innerHTML='<table><thead><tr>'+keys.map(k=>`<th>${esc(k)}</th>`).join('')+
+'</tr></thead><tbody>'+data.map(row=>'<tr>'+keys.map(k=>`<td>${esc(row[k])}</td>`).join('')+'</tr>').join('')+'</tbody></table>'
+}catch(e){table.innerHTML='<p class="error">'+esc(e.message)+'</p>'}}
+showApp();
+</script></body></html>
