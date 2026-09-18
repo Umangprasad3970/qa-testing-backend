@@ -1,9 +1,15 @@
 import os, json, re, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -30,7 +36,7 @@ class TestCase(Base):
 class TestRun(Base):
  __tablename__="test_runs"; id:Mapped[int]=mapped_column(Integer,primary_key=True); project_id:Mapped[int]=mapped_column(ForeignKey("projects.id")); status:Mapped[str]=mapped_column(String(40),default="queued"); started_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True); finished_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True); project:Mapped["Project"]=relationship(back_populates="test_runs"); results:Mapped[list["TestResult"]]=relationship(back_populates="run",cascade="all, delete-orphan")
 class TestResult(Base):
- __tablename__="test_results"; id:Mapped[int]=mapped_column(Integer,primary_key=True); run_id:Mapped[int]=mapped_column(ForeignKey("test_runs.id")); test_case_id:Mapped[int]=mapped_column(ForeignKey("test_cases.id")); status:Mapped[str]=mapped_column(String(40)); error_message:Mapped[Optional[str]]=mapped_column(Text,nullable=True); screenshot_url:Mapped[Optional[str]]=mapped_column(String(1000),nullable=True); duration_ms:Mapped[Optional[int]]=mapped_column(Integer,nullable=True); run:Mapped["TestRun"]=relationship(back_populates="results")
+ __tablename__="test_results"; id:Mapped[int]=mapped_column(Integer,primary_key=True); run_id:Mapped[int]=mapped_column(ForeignKey("test_runs.id")); test_case_id:Mapped[int]=mapped_column(ForeignKey("test_cases.id")); browser:Mapped[str]=mapped_column(String(40),default="chrome"); status:Mapped[str]=mapped_column(String(40)); error_message:Mapped[Optional[str]]=mapped_column(Text,nullable=True); screenshot_url:Mapped[Optional[str]]=mapped_column(String(1000),nullable=True); duration_ms:Mapped[Optional[int]]=mapped_column(Integer,nullable=True); run:Mapped["TestRun"]=relationship(back_populates="results")
 Base.metadata.create_all(engine)
 # Lightweight migration for existing deployments.
 def ensure_schema():
@@ -42,7 +48,16 @@ def ensure_schema():
             else:
                 conn.execute(sql_text("ALTER TABLE users ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 1"))
 ensure_schema()
-app=FastAPI(title="QA Testing Platform API",version="3.0.0"); app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
+def ensure_browser_schema():
+    insp=inspect(engine)
+    if "test_results" in insp.get_table_names() and "browser" not in {c["name"] for c in insp.get_columns("test_results")}:
+        with engine.begin() as conn:
+            if engine.dialect.name == "postgresql":
+                conn.execute(sql_text("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS browser VARCHAR(40) NOT NULL DEFAULT 'chrome'"))
+            else:
+                conn.execute(sql_text("ALTER TABLE test_results ADD COLUMN browser VARCHAR(40) NOT NULL DEFAULT 'chrome'"))
+ensure_browser_schema()
+app=FastAPI(title="QA Testing Platform API",version="4.0.0"); app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 def db():
  s=SessionLocal();
  try: yield s
@@ -61,7 +76,9 @@ def admin_only(user:User=Depends(current_user)):
 class Login(BaseModel): email:EmailStr; password:str
 class Register(BaseModel): name:str; email:EmailStr; password:str
 class ProjectIn(BaseModel): name:str; website_url:str; description:Optional[str]=None
-class TestRunIn(BaseModel): project_id:int
+class TestRunIn(BaseModel):
+ project_id:int
+ browsers:Optional[List[str]]=None
 class AdminUserCreate(BaseModel): name:str; email:EmailStr; password:str
 class AdminUserUpdate(BaseModel): name:Optional[str]=None; email:Optional[EmailStr]=None; password:Optional[str]=None
 class UserStatusUpdate(BaseModel): is_active:bool
@@ -171,32 +188,152 @@ def get_cases(project_id:int,user:User=Depends(current_user),session:Session=Dep
  p=session.get(Project,project_id)
  if not p or p.user_id!=user.id: raise HTTPException(404,"Project not found")
  return [{"id":t.id,"title":t.title,"steps":t.steps,"expected_result":t.expected_result} for t in p.test_cases]
+def _classify_case(tc):
+ s=(tc.title+" "+tc.steps+" "+tc.expected_result).lower()
+ if any(x in s for x in ["login","sign in","password","logout"]): return "authentication"
+ if any(x in s for x in ["register","registration","sign up","create account"]): return "registration"
+ if any(x in s for x in ["upload","file"]): return "upload"
+ if any(x in s for x in ["search","filter","sort"]): return "search"
+ if any(x in s for x in ["mobile","desktop","responsive","viewport"]): return "responsive"
+ if any(x in s for x in ["api","endpoint","http"]): return "api"
+ if any(x in s for x in ["payment","checkout","cart","order"]): return "commerce"
+ if any(x in s for x in ["role","permission","authorized","access"]): return "authorization"
+ return "general"
+
+SUPPORTED_BROWSERS = {"chrome", "firefox", "safari", "opera"}
+
+def _browser_engine_label(name):
+ return {"chrome":"Chromium", "firefox":"Firefox", "safari":"WebKit (Safari engine)", "opera":"Opera"}.get(name,name)
+
+def _opera_executable():
+ return os.getenv("OPERA_EXECUTABLE_PATH") or os.getenv("OPERA_PATH")
+
+async def _launch_browser(pw, name):
+ name=name.lower()
+ if name=="chrome":
+  return await pw.chromium.launch(headless=True,args=["--no-sandbox"])
+ if name=="firefox":
+  return await pw.firefox.launch(headless=True)
+ if name=="safari":
+  return await pw.webkit.launch(headless=True)
+ if name=="opera":
+  path=_opera_executable()
+  if not path:
+   raise RuntimeError("Opera is unavailable on this server. Set OPERA_EXECUTABLE_PATH to an Opera executable.")
+  return await pw.chromium.launch(headless=True,executable_path=path,args=["--no-sandbox"])
+ raise RuntimeError(f"Unsupported browser: {name}")
+
+async def _browser_case(page, tc, url):
+ category=_classify_case(tc)
+ started=datetime.now(timezone.utc)
+ try:
+  response=await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+  code=response.status if response else 0
+  if not (200 <= code < 400):
+   return "failed", f"Project URL returned HTTP {code}", int((datetime.now(timezone.utc)-started).total_seconds()*1000)
+  await page.wait_for_timeout(500)
+  if category=="authentication":
+   password=await page.locator('input[type="password"]').count()
+   controls=await page.locator('button, input[type="submit"], [role="button"]').count()
+   status="passed" if password and controls else "failed"
+   err=None if status=="passed" else "Login UI controls were not detected on the loaded page."
+  elif category=="registration":
+   inputs=await page.locator('input').count()
+   status="passed" if inputs >= 2 else "failed"
+   err=None if status=="passed" else "Registration form controls were not sufficiently detected."
+  elif category=="upload":
+   count=await page.locator('input[type="file"]').count()
+   status="passed" if count else "failed"
+   err=None if status=="passed" else "No file-upload control was detected on the loaded page."
+  elif category=="search":
+   count=await page.locator('input[type="search"], input[placeholder*="search" i], [aria-label*="search" i]').count()
+   status="passed" if count else "failed"
+   err=None if status=="passed" else "No searchable input/control was detected on the loaded page."
+  elif category=="responsive":
+   status="passed"; err=None
+   for width in (375,768,1440):
+    await page.set_viewport_size({"width":width,"height":900})
+    await page.reload(wait_until="domcontentloaded", timeout=30000)
+    overflow=await page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth + 8")
+    if overflow:
+     status="failed"; err=f"Horizontal overflow detected at viewport width {width}px."; break
+  else:
+   # Safe, non-destructive validation: the page loads and exposes meaningful DOM content.
+   text=(await page.locator("body").inner_text())[:2000].strip()
+   status="passed" if len(text)>=20 else "failed"
+   err=None if status=="passed" else "Loaded page contains too little visible content for automated validation."
+  return status,err,int((datetime.now(timezone.utc)-started).total_seconds()*1000)
+ except Exception as e:
+  return "failed", str(e)[:500], int((datetime.now(timezone.utc)-started).total_seconds()*1000)
+
+@app.get("/api/test-runs/supported-browsers")
+def supported_browsers(user:User=Depends(current_user)):
+ out=[]
+ for name in ["chrome","firefox","safari","opera"]:
+  available=False; reason=None
+  if not PLAYWRIGHT_AVAILABLE:
+   reason="Playwright is not installed on the server."
+  elif name in {"chrome","firefox","safari"}:
+   available=True
+  else:
+   available=bool(_opera_executable())
+   if not available: reason="Opera executable is not configured. Set OPERA_EXECUTABLE_PATH on the server."
+  out.append({"browser":name,"engine":_browser_engine_label(name),"available":available,"reason":reason})
+ return out
+
 @app.post("/api/test-runs")
 def run_tests(data:TestRunIn,user:User=Depends(current_user),session:Session=Depends(db)):
  p=session.get(Project,data.project_id)
  if not p or p.user_id!=user.id: raise HTTPException(404,"Project not found")
  cases=p.test_cases
  if not cases: raise HTTPException(400,"Generate test cases first")
+ browsers=[b.lower() for b in (data.browsers or ["chrome","firefox","safari","opera"]) ]
+ if not browsers: browsers=["chrome","firefox","safari","opera"]
+ invalid=[b for b in browsers if b not in SUPPORTED_BROWSERS]
+ if invalid: raise HTTPException(400,f"Unsupported browsers: {', '.join(invalid)}")
  r=TestRun(project_id=p.id,status="running",started_at=datetime.now(timezone.utc));session.add(r);session.flush()
- start=datetime.now(timezone.utc); status="failed"; err=None
- try:
-  req=urllib.request.Request(p.website_url,headers={"User-Agent":"QA-Testing-Platform/2.0"}); resp=urllib.request.urlopen(req,timeout=20); code=resp.getcode(); status="passed" if 200<=code<400 else "failed"; err=None if status=="passed" else f"HTTP status {code}"
- except Exception as e: err=str(e)[:500]
- dur=int((datetime.now(timezone.utc)-start).total_seconds()*1000)
- for tc in cases: session.add(TestResult(run_id=r.id,test_case_id=tc.id,status=status,error_message=err,duration_ms=dur))
- r.status="completed";r.started_at=r.started_at;r.finished_at=datetime.now(timezone.utc);session.commit();return {"message":f"Automated smoke run completed: {status}","run_id":r.id}
+
+ async def execute():
+  async with async_playwright() as pw:
+   out=[]
+   for browser_name in browsers:
+    try:
+     browser=await _launch_browser(pw,browser_name)
+     page=await browser.new_page(viewport={"width":1280,"height":900})
+     for tc in cases:
+      status,err,dur=await _browser_case(page,tc,p.website_url)
+      out.append((tc,browser_name,status,err,dur))
+     await browser.close()
+    except Exception as e:
+     for tc in cases:
+      out.append((tc,browser_name,"failed",f"{_browser_engine_label(browser_name)} could not be started: {str(e)[:450]}",None))
+   return out
+
+ if PLAYWRIGHT_AVAILABLE:
+  try: results=asyncio.run(execute())
+  except Exception as e: results=[(tc,b,"failed",f"Automation run could not start: {str(e)[:450]}",None) for b in browsers for tc in cases]
+ else:
+  results=[(tc,b,"failed","Playwright is not installed on the server.",None) for b in browsers for tc in cases]
+
+ for tc,browser,status,err,dur in results:
+  session.add(TestResult(run_id=r.id,test_case_id=tc.id,browser=browser,status=status,error_message=err,duration_ms=dur))
+ passed=sum(x[2]=="passed" for x in results); failed=sum(x[2]=="failed" for x in results); blocked=sum(x[2]=="blocked" for x in results); total=len(results)
+ r.status="completed"; r.finished_at=datetime.now(timezone.utc); session.commit()
+ return {"message":f"Cross-browser run completed: {passed} passed, {failed} failed, {blocked} blocked across {len(browsers)} browser(s)","run_id":r.id,"status":r.status,"browsers":browsers,"total":total,"passed":passed,"failed":failed,"blocked":blocked}
+
 @app.get("/api/projects/{project_id}/report")
-def report(project_id:int,user:User=Depends(current_user),session:Session=Depends(db)):
+def project_report(project_id:int,user:User=Depends(current_user),session:Session=Depends(db)):
  p=session.get(Project,project_id)
  if not p or p.user_id!=user.id: raise HTTPException(404,"Project not found")
- cases=p.test_cases; latest=session.query(TestRun).filter(TestRun.project_id==project_id).order_by(TestRun.id.desc()).first(); results=[]
+ latest=session.query(TestRun).filter(TestRun.project_id==p.id).order_by(TestRun.id.desc()).first()
+ results=[]
  if latest:
-  by={x.test_case_id:x for x in latest.results}
-  for tc in cases:
-   x=by.get(tc.id);results.append({"test_case_id":tc.id,"test_case_title":tc.title,"status":x.status if x else "not_run","error_message":x.error_message if x else None})
- total=len(cases);passed=sum(x["status"]=="passed" for x in results);failed=sum(x["status"]=="failed" for x in results);notrun=total-passed-failed; pct=round((passed/total)*100,2) if total else 0
- final="PASS" if total and failed==0 and notrun==0 else ("FAIL" if failed>0 else "NOT RUN")
- return {"project_name":p.name,"website_url":p.website_url,"total":total,"passed":passed,"failed":failed,"not_run":notrun,"pass_percentage":pct,"final_status":final,"results":results}
+  for x in latest.results:
+   tc=session.get(TestCase,x.test_case_id)
+   results.append({"test_case_id":x.test_case_id,"test_case_title":tc.title if tc else None,"browser":x.browser,"status":x.status,"error_message":x.error_message,"duration_ms":x.duration_ms})
+ total=len(results); passed=sum(x["status"]=="passed" for x in results); failed=sum(x["status"]=="failed" for x in results); notrun=max(0,len(p.test_cases)*max(1,len(set(x["browser"] for x in results))) - total) if results else len(p.test_cases)
+ return {"project_name":p.name,"website_url":p.website_url,"total":total,"passed":passed,"failed":failed,"not_run":notrun,"pass_percentage":round(passed*100/total,2) if total else 0,"final_status":"PASS" if total and failed==0  else ("FAIL" if failed else "NOT RUN"),"results":results,"browsers":sorted(set(x["browser"] for x in results))}
+
 @app.get("/api/admin/dashboard")
 def admin_dashboard(admin:User=Depends(admin_only),session:Session=Depends(db)):
  return {"users":session.query(User).count(),"active_users":session.query(User).filter(User.is_admin==False,User.is_active==True).count(),"inactive_users":session.query(User).filter(User.is_admin==False,User.is_active==False).count(),"projects":session.query(Project).count(),"test_cases":session.query(TestCase).count(),"test_runs":session.query(TestRun).count(),"test_results":session.query(TestResult).count(),"passed":session.query(TestResult).filter(TestResult.status.ilike("passed")).count(),"failed":session.query(TestResult).filter(TestResult.status.ilike("failed")).count()}
@@ -287,7 +424,7 @@ def admin_test_results(admin:User=Depends(admin_only),session:Session=Depends(db
  rows=[]
  for x in session.query(TestResult).order_by(TestResult.id.desc()).all():
   tc=session.get(TestCase,x.test_case_id); run=x.run; project=session.get(Project,run.project_id)
-  rows.append({"id":x.id,"run_id":x.run_id,"test_case_id":x.test_case_id,"test_case_title":tc.title if tc else None,"project_id":project.id,"project_name":project.name,"user_id":project.user_id,"status":x.status,"error_message":x.error_message,"duration_ms":x.duration_ms})
+  rows.append({"id":x.id,"run_id":x.run_id,"test_case_id":x.test_case_id,"test_case_title":tc.title if tc else None,"project_id":project.id,"project_name":project.name,"user_id":project.user_id,"browser":x.browser,"status":x.status,"error_message":x.error_message,"duration_ms":x.duration_ms})
  return rows
 
 # --- Dedicated admin pages and management/report APIs ---
@@ -330,8 +467,8 @@ def admin_project_report(project_id:int, admin:User=Depends(admin_only), session
         for tc in cases:
             x=by.get(tc.id)
             results.append({'test_case_id':tc.id,'title':tc.title,'status':x.status if x else 'not_run','error_message':x.error_message if x else None,'duration_ms':x.duration_ms if x else None})
-    total=len(cases); passed=sum(x['status']=='passed' for x in results); failed=sum(x['status']=='failed' for x in results); notrun=total-passed-failed
-    return {'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'total':total,'passed':passed,'failed':failed,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0 and notrun==0 else ('FAIL' if failed else 'NOT RUN'),'latest_run_id':latest.id if latest else None,'latest_run_status':latest.status if latest else None,'results':results}
+    total=len(cases); passed=sum(x['status']=='passed' for x in results); failed=sum(x['status']=='failed' for x in results); blocked=sum(x['status']=='blocked' for x in results); notrun=total-passed-failed-blocked
+    return {'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'total':total,'passed':passed,'failed':failed,'blocked':blocked,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0  and notrun==0 else ('FAIL' if failed else ('BLOCKED' if blocked else 'NOT RUN')),'latest_run_id':latest.id if latest else None,'latest_run_status':latest.status if latest else None,'results':results}
 
 @app.get('/api/admin/project-reports')
 def admin_project_reports(admin:User=Depends(admin_only), session:Session=Depends(db)):
@@ -339,8 +476,9 @@ def admin_project_reports(admin:User=Depends(admin_only), session:Session=Depend
     for p in session.query(Project).order_by(Project.id.desc()).all():
         latest=session.query(TestRun).filter(TestRun.project_id==p.id).order_by(TestRun.id.desc()).first()
         rs=session.query(TestResult).filter(TestResult.run_id==latest.id).all() if latest else []
-        total=len(p.test_cases); passed=sum(x.status=='passed' for x in rs); failed=sum(x.status=='failed' for x in rs); notrun=total-passed-failed
-        out.append({'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'total':total,'passed':passed,'failed':failed,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0 and notrun==0 else ('FAIL' if failed else 'NOT RUN'),'last_run_id':latest.id if latest else None,'last_run_status':latest.status if latest else None})
+        total=len(rs); passed=sum(x.status=='passed' for x in rs); failed=sum(x.status=='failed' for x in rs); notrun=0
+        browsers=sorted({x.browser for x in rs})
+        out.append({'project_id':p.id,'project_name':p.name,'website_url':p.website_url,'user_id':p.user_id,'user_email':p.user.email,'test_cases':len(p.test_cases),'total':total,'passed':passed,'failed':failed,'blocked':blocked,'not_run':notrun,'pass_percentage':round(passed*100/total,2) if total else 0,'final_status':'PASS' if total and failed==0  else ('FAIL' if failed else ('BLOCKED' if blocked else 'NOT RUN')),'last_run_id':latest.id if latest else None,'last_run_status':latest.status if latest else None,'browsers':browsers})
     return out
 
 @app.delete('/api/admin/test-cases/{test_case_id}')

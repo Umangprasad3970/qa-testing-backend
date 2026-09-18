@@ -39,3 +39,9 @@ Admin accounts are rejected by client-login. Inactive users are rejected.
 
 ## Ownership/security
 User project, document, test-case, test-run and report endpoints validate that the authenticated user owns the project. Admin endpoints require an administrator JWT.
+
+
+## Cross-browser automation
+The automated runner supports Chrome (Chromium), Firefox, Safari-compatible WebKit, and Opera when an Opera executable is configured. Render/Linux can run Chromium, Firefox and WebKit; Apple's Safari application itself cannot be launched on Linux. For Opera, set OPERA_EXECUTABLE_PATH where Opera is installed. The API records browser per result and exposes browser-by-browser reports.
+
+Run endpoint accepts JSON: {"project_id": 1, "browsers": ["chrome", "firefox", "safari", "opera"]}.
